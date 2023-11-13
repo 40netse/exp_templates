@@ -1,0 +1,198 @@
+provider "aws" {
+  region     = var.region
+}
+
+locals {
+  base_ip              = split(".", element(split("/", var.vpc_cidr_block), 0))
+  base_netmask         = tonumber(element(split("/", var.vpc_cidr_block), 1))
+  step_num             = local.base_netmask <= 19 ? 1 : 16
+  subnet_netmask       = local.step_num == 1 ? 24 : 28
+  subnet_prefixs       = var.fgt_intf_mode == "1-arm" ? ["fgt_login_", "tgw_attachment_", "gwlbe_"] : ["fgt_login_", "fgt_internal_", "tgw_attachment_", "gwlbe_"]
+  internal_port_prefix = var.fgt_intf_mode == "1-arm" ? "fgt_login_" : "fgt_internal_"
+  subnets = var.subnets != {} ? var.subnets : merge([for az_i in range(length(var.availability_zones)) : merge([
+    for sn_i in range(length(local.subnet_prefixs)) : {
+      "${local.subnet_prefixs[sn_i]}${var.availability_zones[az_i]}" = {
+        cidr_block        = "${local.base_ip[0]}.${local.base_ip[1]}.%{if local.step_num == 1}${tostring(tonumber(local.base_ip[2]) + az_i * length(local.subnet_prefixs) + sn_i)}%{else}${local.base_ip[2]}%{endif}.%{if local.step_num != 1}${tostring(tonumber(local.base_ip[3]) + (az_i * length(local.subnet_prefixs) + sn_i) * 16)}%{else}${local.base_ip[2]}%{endif}/${local.subnet_netmask}"
+        availability_zone = "${var.availability_zones[az_i]}"
+      }
+    }
+    ]...)
+  ]...)
+  
+  # AZ name map
+  az_name_map = {
+    for az_i in range(length(var.availability_zones)) : var.availability_zones[az_i] => "geneve-az${az_i + 1}"
+  }
+}
+
+# Create security VPC including subnets, IGW, and security groups
+module "security-vpc" {
+  source = "../../modules/aws/vpc"
+
+  existing_vpc    = var.existing_security_vpc
+  vpc_name        = var.vpc_name
+  igw_name        = var.igw_name
+  security_groups = var.security_groups
+  vpc_cidr_block  = var.vpc_cidr_block
+  subnets         = local.subnets
+
+  tags = {
+    general = var.general_tags
+  }
+}
+
+
+# Create FortiGate Auto Scaling group
+module "fgt_asg" {
+  source   = "../../modules/fortigate/fgt_asg"
+  for_each = var.asgs
+  # FortiGate instance template
+  template_name                  = lookup(each.value, "template_name", "")
+  fgt_version                    = each.value.fgt_version
+  instance_type                  = lookup(each.value, "instance_type", "c5.xlarge")
+  license_type                   = lookup(each.value, "license_type", "on_demand")
+  fgt_hostname                   = lookup(each.value, "fgt_hostname", "")
+  fgt_password                   = each.value.fgt_password
+  fgt_multi_vdom                 = lookup(each.value, "fgt_multi_vdom", false)
+  lic_folder_path                = lookup(each.value, "lic_folder_path", null)
+  lic_s3_name                    = lookup(each.value, "lic_s3_name", null)
+  fortiflex_refresh_token        = lookup(each.value, "fortiflex_refresh_token", "")
+  fortiflex_sn_list              = lookup(each.value, "fortiflex_sn_list", [])
+  fortiflex_configid_list        = lookup(each.value, "fortiflex_configid_list", [])
+  keypire_name                   = each.value.keypair_name
+  enable_fgt_system_autoscale    = lookup(each.value, "enable_fgt_system_autoscale", false)
+  fgt_system_autoscale_psksecret = lookup(each.value, "fgt_system_autoscale_psksecret", "")
+  fgt_login_port_number          = lookup(each.value, "fgt_login_port_number", "")
+  user_conf = (
+    lookup(each.value, "user_conf_content", "") != "" && lookup(each.value, "user_conf_file_path", "") != "" ?
+    format("%s\n%s", file(each.value["user_conf_file_path"]), each.value["user_conf_content"]) :
+    lookup(each.value, "user_conf_file_path", "") != "" ? file(each.value["user_conf_file_path"]) : lookup(each.value, "user_conf_content", "")
+  )
+
+  user_conf_s3 = lookup(each.value, "user_conf_s3", {})
+
+  # Auto Scale Group
+  availability_zones    = var.availability_zones
+  asg_name              = each.key
+  asg_max_size          = each.value.asg_max_size
+  asg_min_size          = each.value.asg_min_size
+  asg_desired_capacity  = lookup(each.value, "asg_desired_capacity", null)
+  scale_policies        = lookup(each.value, "scale_policies", {})
+  create_dynamodb_table = lookup(each.value, "create_dynamodb_table", null)
+  dynamodb_table_name   = lookup(each.value, "dynamodb_table_name", null)
+  network_interfaces = jsondecode(
+    var.fgt_intf_mode == "1-arm" ? jsonencode({
+      mgmt = {
+        device_index      = 0
+        subnet_id_map     = { for k, v in local.subnets : v["availability_zone"] => module.security-vpc.subnets[k] if startswith(k, "fgt_login_") }
+        enable_public_ip  = true
+        to_gwlb           = true
+        source_dest_check = true
+        security_groups   = [module.security-vpc.security_group[each.value.intf_security_group["login_port"]]]
+      }
+      }) : jsonencode({
+            mgmt = {
+        device_index      = 1
+        #subnet_id_map     = { for k, v in local.subnets : v["availability_zone"] => module.security-vpc.subnets[k] if startswith(k, "fgt_login_") }
+              subnet_id_map          = {
+        "us-west-2a" = "subnet-0f53e21e1dfde9a0f", # FIX THIS
+        "us-west-2c" = "subnet-0e93e323c93d72994"  # FIX THIS
+      }
+        enable_public_ip  = true
+        source_dest_check = true
+        security_groups   = [module.security-vpc.security_group[each.value.intf_security_group["login_port"]]]
+      },
+      internal_traffic = {
+        device_index    = 0
+        to_gwlb         = true
+        subnet_id_map        = {
+        "us-west-2a" = "subnet-0f0bdfce16274cd38", # FIX THIS
+        "us-west-2c" = "subnet-08c181cf393418775"  # FIX THIS
+      }
+        #subnet_id_map   = { for k, v in local.subnets : v["availability_zone"] => module.security-vpc.subnets[k] if startswith(k, "fgt_internal_") }
+        security_groups = [module.security-vpc.security_group[each.value.intf_security_group["internal_port"]]]
+      }
+    })
+  )
+
+  create_geneve_for_all_az = var.enable_cross_zone_load_balancing
+  gwlb_ips                 = module.security-vpc-gwlb.gwlb_ips
+  asg_health_check_type    = "ELB"
+  asg_gwlb_tgp             = [module.security-vpc-gwlb.gwlb_tgp.arn]
+  lambda_timeout           = 500
+  az_name_map              = local.az_name_map
+  tags = {
+    general = var.general_tags
+  }
+  depends_on = [
+    module.security-vpc,
+    module.security-vpc-gwlb
+  ]
+}
+
+# Create Cloudwatch Alarm 
+resource "aws_cloudwatch_metric_alarm" "hybrid_asg" {
+  for_each = var.cloudwatch_alarms
+
+  alarm_name          = each.key
+  comparison_operator = lookup(each.value, "comparison_operator", null)
+  evaluation_periods  = lookup(each.value, "evaluation_periods", null)
+  metric_name         = lookup(each.value, "metric_name", null)
+  namespace           = lookup(each.value, "namespace", null)
+  period              = lookup(each.value, "period", null)
+  statistic           = lookup(each.value, "statistic", null)
+  threshold           = lookup(each.value, "threshold", null)
+  dimensions          = lookup(each.value, "dimensions", null)
+  alarm_description   = lookup(each.value, "alarm_description", null)
+  datapoints_to_alarm = lookup(each.value, "datapoints_to_alarm", null)
+  alarm_actions = (
+    lookup(each.value, "alarm_asg_policies", null) == null ?
+    null :
+    compact(
+      distinct(
+        concat(
+          lookup(each.value.alarm_asg_policies, "policy_arn_list", []),
+          lookup(each.value.alarm_asg_policies, "policy_name_map", null) == null ?
+          [] :
+          flatten(
+            [
+              for asg_name, policy_list in each.value.alarm_asg_policies["policy_name_map"] : [
+                for policy_name in each.value.alarm_asg_policies["policy_name_map"][asg_name] : module.fgt_asg[asg_name].asg_policy_list[policy_name].arn if lookup(module.fgt_asg[asg_name].asg_policy_list, policy_name, null) != null
+              ]
+            ]
+          )
+        )
+      )
+    )
+  )
+  tags = var.general_tags
+}
+
+# Create Gateway Load Balancer including GWLB Endpoints
+module "security-vpc-gwlb" {
+  source = "../../modules/aws/gwlb"
+
+  gwlb_name                        = var.gwlb_name
+  subnets                          = ["subnet-02fb0abef7b3d5496","subnet-01d3e20c6211465b8"] # FIX THIS
+  tgp_name                         = var.tgp_name
+  deregistration_delay             = 30
+  enable_cross_zone_load_balancing = var.enable_cross_zone_load_balancing
+  health_check = {
+    port     = 80
+    protocol = "TCP"
+  }
+  vpc_id       = module.security-vpc.vpc_id
+  gwlb_ln_name = "gwlb-ln"
+  ##Mudar aqui
+  ##gwlb_endps = { for k, v in module.security-vpc.subnets : k => {
+  ##  vpc_id    = module.security-vpc.vpc_id
+  ##  subnet_id = v
+  ##  } if startswith(k, "gwlbe_")
+##  }
+  tags = {
+    general = var.general_tags
+  }
+  depends_on = [
+    module.security-vpc
+  ]
+}
